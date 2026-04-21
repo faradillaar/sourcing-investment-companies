@@ -292,9 +292,11 @@ def ensure_company_type_table() -> None:
     """)
     # Safely add new columns to companies (ignored if they already exist)
     for col_def in [
-        "alter table public.companies add column if not exists region       text",
-        "alter table public.companies add column if not exists sic_code     text",
-        "alter table public.companies add column if not exists section_type text",
+        "alter table public.companies add column if not exists region              text",
+        "alter table public.companies add column if not exists sic_code            text",
+        "alter table public.companies add column if not exists section_type        text",
+        "alter table public.companies add column if not exists investment_score    int",
+        "alter table public.companies add column if not exists score_updated_at   timestamptz",
     ]:
         try:
             db_execute(col_def)
@@ -1932,6 +1934,15 @@ def calculate_investment_score(profile: Dict[str, Any], officers_df: pd.DataFram
     return score, reasons
 
 
+def save_investment_score(company_number: str, score: int) -> None:
+    db_execute("""
+        update public.companies
+        set investment_score  = %s,
+            score_updated_at  = now()
+        where company_number = %s
+    """, (score, company_number))
+
+
 # =========================================================
 # UI HELPERS
 # =========================================================
@@ -2304,6 +2315,7 @@ def render_main_page():
         filing_df = get_or_refresh_filing_history(selected_company_number)
 
     score, reasons = calculate_investment_score(profile, officers_df, psc_df, charges_df, filing_df)
+    save_investment_score(selected_company_number, score)
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "Officers", "PSC", "Charges", "Filing History", "Raw JSON"])
 
@@ -2512,7 +2524,8 @@ def _render_browse_section():
             address_snippet,
             region,
             sic_code,
-            section_type
+            section_type,
+            investment_score
         from public.companies
         {where_clause}
         order by title asc
@@ -2527,12 +2540,16 @@ def _render_browse_section():
 
     df = pd.DataFrame(rows, columns=[
         "company_number", "title", "company_status", "company_type",
-        "date_of_creation", "address_snippet", "region", "sic_code", "section_type"
+        "date_of_creation", "address_snippet", "region", "sic_code", "section_type",
+        "investment_score"
     ])
     df["date_of_creation"] = df["date_of_creation"].astype(str)
+    df["Score"] = df["investment_score"].apply(
+        lambda x: f"{score_color(int(x))} {int(x)}" if pd.notna(x) else "—"
+    )
 
     st.dataframe(
-        df.rename(columns={
+        df.drop(columns=["investment_score"]).rename(columns={
             "company_number": "Company #",
             "title": "Name",
             "company_status": "Status",
@@ -2565,6 +2582,7 @@ def _render_browse_section():
                 filing_df = get_or_refresh_filing_history(selected_cn)
 
             score, reasons = calculate_investment_score(profile, officers_df, psc_df, charges_df, filing_df)
+            save_investment_score(selected_cn, score)
 
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "Officers", "PSC", "Charges", "Filing History", "Raw JSON"])
 
@@ -2761,7 +2779,75 @@ def render_admin_page():
         st.success(f"Done! Attempted to insert {count} SIC code rows (duplicates skipped automatically).")
     st.markdown("---")
 
-    st.markdown("## Upload CSV Keywords")
+    # ── Recalculate All Scores ────────────────────────────────────────────────
+    st.markdown("## Recalculate Investment Scores")
+    st.caption(
+        "Recalculate investment scores for all companies that have fully cached data "
+        "(officers, PSC, charges, filing history). No API calls are made — reads from DB only. "
+        "Run this after changing the scoring rules."
+    )
+
+    scoreable_row = db_fetchone("""
+        select count(distinct c.company_number)
+        from public.companies c
+        where exists (select 1 from public.officers o where o.company_number = c.company_number)
+    """)
+    scoreable_count = scoreable_row[0] if scoreable_row else 0
+    st.info(f"**{scoreable_count}** companies have cached data and can be rescored.")
+
+    if st.button("🔢 Recalculate All Scores", type="primary", use_container_width=True):
+        company_rows = db_fetchall(
+            "select company_number from public.companies order by title asc"
+        )
+        total_rs = len(company_rows)
+        rs_progress = st.progress(0)
+        rs_status = st.empty()
+        rs_ok, rs_skip = 0, 0
+
+        for i, (cn,) in enumerate(company_rows, start=1):
+            try:
+                record = get_company_record(cn)
+                if not record or not record[8]:
+                    rs_skip += 1
+                    continue
+
+                profile = record[8]
+                officers_rows, _ = get_cached_officers(cn)
+                officers_df = pd.DataFrame(officers_rows, columns=[
+                    "officer_name", "officer_role", "appointed_on", "resigned_on",
+                    "nationality", "occupation", "country_of_residence", "last_fetched_at"
+                ]) if officers_rows else pd.DataFrame()
+
+                psc_rows, _ = get_cached_psc(cn)
+                psc_df = pd.DataFrame(psc_rows, columns=[
+                    "name", "kind", "nationality", "country_of_residence",
+                    "natures_of_control", "notified_on", "ceased_on", "last_fetched_at"
+                ]) if psc_rows else pd.DataFrame()
+
+                charges_rows, _ = get_cached_charges(cn)
+                charges_df = pd.DataFrame(charges_rows, columns=[
+                    "charge_code", "status", "classification", "created_on",
+                    "delivered_on", "satisfied_on", "secured_details", "last_fetched_at"
+                ]) if charges_rows else pd.DataFrame()
+
+                filing_rows, _ = get_cached_filing_history(cn)
+                filing_df = pd.DataFrame(filing_rows, columns=[
+                    "transaction_id", "filing_type", "category",
+                    "description", "date", "pages", "last_fetched_at"
+                ]) if filing_rows else pd.DataFrame()
+
+                score, _ = calculate_investment_score(profile, officers_df, psc_df, charges_df, filing_df)
+                save_investment_score(cn, score)
+                rs_ok += 1
+            except Exception:
+                rs_skip += 1
+            finally:
+                rs_progress.progress(min(i / total_rs, 1.0))
+                rs_status.info(f"Progress: {i}/{total_rs} • rescored: {rs_ok} • skipped: {rs_skip}")
+
+        rs_progress.progress(1.0)
+        rs_status.success(f"Done! {rs_ok} companies rescored, {rs_skip} skipped (no cached data).")
+    st.markdown("---")
     st.caption(
         "Upload a CSV containing company keywords. The app processes keywords in small batches, "
         "uses cache aggressively, and respects API rate limits."
