@@ -1520,7 +1520,7 @@ def replace_charges(company_number: str, items: List[Dict[str, Any]]) -> None:
             classification,
             parse_date(item.get("created_on")),
             parse_date(item.get("delivered_on")),
-            parse_date((item.get("satisfied_on") or {}).get("on")),
+            parse_date(item.get("satisfied_on").get("on") if isinstance(item.get("satisfied_on"), dict) else item.get("satisfied_on")),
             secured_details,
             to_json(item),
         ))
