@@ -2032,6 +2032,7 @@ def render_search_results(results_df: pd.DataFrame):
 
     show_df = results_df.copy()
     show_df["date_of_creation"] = show_df["date_of_creation"].astype(str)
+    show_df = show_df.drop(columns=["rank_order", "description"], errors="ignore")
     show_df = show_df.rename(columns={
         "company_number": "Company Number",
         "title": "Title",
@@ -2039,7 +2040,6 @@ def render_search_results(results_df: pd.DataFrame):
         "company_type": "Type",
         "date_of_creation": "Created",
         "address_snippet": "Address",
-        "rank_order": "Rank"
     })
 
     st.dataframe(show_df, use_container_width=True, hide_index=True)
@@ -2251,11 +2251,17 @@ def render_main_page():
         st.warning("Could not read company number from selection.")
         return
 
-    action_col1, action_col2, _ = st.columns([1, 1, 4])
+    action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns([1, 1, 1, 1, 1])
     with action_col1:
         force_refresh_profile = st.button("Refresh Profile")
     with action_col2:
         force_refresh_officers = st.button("Refresh Officers")
+    with action_col3:
+        force_refresh_psc = st.button("Refresh PSC")
+    with action_col4:
+        force_refresh_charges = st.button("Refresh Charges")
+    with action_col5:
+        force_refresh_filing = st.button("Refresh Filing")
 
     if force_refresh_profile:
         db_execute("""
@@ -2271,6 +2277,18 @@ def render_main_page():
             where company_number = %s
         """, (selected_company_number,))
         st.success("Officers cache cleared.")
+
+    if force_refresh_psc:
+        db_execute("delete from public.psc where company_number = %s", (selected_company_number,))
+        st.success("PSC cache cleared.")
+
+    if force_refresh_charges:
+        db_execute("delete from public.charges where company_number = %s", (selected_company_number,))
+        st.success("Charges cache cleared.")
+
+    if force_refresh_filing:
+        db_execute("delete from public.filing_history where company_number = %s", (selected_company_number,))
+        st.success("Filing history cache cleared.")
 
     with st.spinner("Loading company details..."):
         profile = get_or_refresh_company_profile(selected_company_number)
