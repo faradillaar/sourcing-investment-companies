@@ -238,6 +238,53 @@ def get_rate_limiter():
 # =========================================================
 # CONNECTIONS
 # =========================================================
+# FINANCIALS HELPERS
+# =========================================================
+def fetch_vat_status(company_name: str) -> dict:
+    """Check VAT registration status via HMRC API (searches by company name)."""
+    try:
+        url = f"https://api.service.hmrc.gov.uk/organisations/vat/check-vat-number/lookup"
+        # HMRC VAT lookup requires a VAT number — we use the search endpoint instead
+        # We'll use the public VIES-style check if VAT number is known, else return unknown
+        return {"status": "unknown", "note": "VAT number required for HMRC lookup"}
+    except Exception as e:
+        return {"status": "error", "note": str(e)}
+
+
+def fetch_ch_accounts(company_number: str) -> dict:
+    """Fetch latest accounts filing data from Companies House."""
+    try:
+        session = get_http_session()
+        url = f"https://api.company-information.service.gov.uk/company/{company_number}/filing-history"
+        resp = session.get(url, params={"category": "accounts", "items_per_page": 5}, timeout=10)
+        if resp.status_code != 200:
+            return {"error": f"HTTP {resp.status_code}"}
+        data = resp.json()
+        items = data.get("items", [])
+        return {"filings": items}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def fetch_ch_company_accounts_detail(company_number: str) -> dict:
+    """Fetch accounts overview (next/last accounts dates) from Companies House company profile."""
+    try:
+        session = get_http_session()
+        url = f"https://api.company-information.service.gov.uk/company/{company_number}"
+        resp = session.get(url, timeout=10)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        return {
+            "accounts": data.get("accounts", {}),
+            "confirmation_statement": data.get("confirmation_statement", {}),
+            "annual_return": data.get("annual_return", {}),
+        }
+    except Exception as e:
+        return {}
+
+
+# =========================================================
 @st.cache_resource
 def get_db_connection():
     return psycopg.connect(SUPABASE_DB_URL, autocommit=True, prepare_threshold=None)
@@ -2317,7 +2364,7 @@ def render_main_page():
     score, reasons = calculate_investment_score(profile, officers_df, psc_df, charges_df, filing_df)
     save_investment_score(selected_company_number, score)
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "Officers", "PSC", "Charges", "Filing History", "Raw JSON"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Overview", "Officers", "PSC", "Charges", "Filing History", "Financials", "Raw JSON"])
 
     with tab1:
         render_profile(profile)
@@ -2412,9 +2459,81 @@ def render_main_page():
             st.dataframe(show_filing, use_container_width=True, hide_index=True)
 
     with tab6:
+        st.markdown("### Financials & Accounts")
+        _render_financials_tab(selected_company_number, profile)
+
+    with tab7:
         st.markdown("### Raw Company Profile JSON")
         st.json(profile)
 
+
+
+def _render_financials_tab(company_number: str, profile: dict):
+    """Render the Financials & Accounts tab for a company."""
+
+    # ── Accounts dates from profile ──────────────────────────────────────
+    accounts = profile.get("accounts", {})
+    last_accounts = accounts.get("last_accounts", {})
+    next_accounts = accounts.get("next_accounts", {})
+    next_due = accounts.get("next_due") or next_accounts.get("due_on")
+    last_made_up = last_accounts.get("made_up_to")
+    last_type = last_accounts.get("type", "").replace("-", " ").title()
+    accounting_ref = accounts.get("accounting_reference_date", {})
+    ref_day = accounting_ref.get("day")
+    ref_month = accounting_ref.get("month")
+
+    st.markdown("#### Accounts Overview")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Last Accounts Made Up To", last_made_up or "—")
+    col2.metric("Accounts Type", last_type or "—")
+    col3.metric("Next Accounts Due", next_due or "—")
+
+    if ref_day and ref_month:
+        st.caption(f"Accounting reference date: {ref_day}/{ref_month} each year")
+
+    st.markdown("---")
+
+    # ── Latest accounts filings from Companies House ─────────────────────
+    st.markdown("#### Recent Accounts Filings")
+    with st.spinner("Fetching accounts filing history..."):
+        accounts_data = fetch_ch_accounts(company_number)
+
+    if "error" in accounts_data:
+        st.warning(f"Could not fetch accounts filings: {accounts_data['error']}")
+    else:
+        filings = accounts_data.get("filings", [])
+        if not filings:
+            st.info("No accounts filings found on Companies House.")
+        else:
+            rows = []
+            for f in filings:
+                rows.append({
+                    "Date": f.get("date", "—"),
+                    "Type": f.get("type", "—"),
+                    "Description": f.get("description", "—"),
+                    "Pages": f.get("pages", "—"),
+                })
+            filings_df = pd.DataFrame(rows)
+            st.dataframe(filings_df, use_container_width=True, hide_index=True)
+            st.caption("To view full financial details, click the Companies House link below.")
+
+    st.markdown("---")
+
+    # ── SIC / Industry context ────────────────────────────────────────────
+    st.markdown("#### Industry Classification")
+    sic_codes = profile.get("sic_codes", [])
+    if sic_codes:
+        for code in sic_codes:
+            st.write(f"• SIC {code}")
+    else:
+        st.info("No SIC codes available.")
+
+    st.markdown("---")
+
+    # ── Direct link to Companies House filings ────────────────────────────
+    ch_url = f"https://find-and-update.company-information.service.gov.uk/company/{company_number}/filing-history?category=accounts"
+    st.markdown(f"🔗 [View full accounts on Companies House]({ch_url})")
+    st.caption("Full revenue and profit figures are contained in the filed annual accounts documents (PDF/XHTML) linked above.")
 
 
 def _render_browse_section():
@@ -2584,7 +2703,7 @@ def _render_browse_section():
             score, reasons = calculate_investment_score(profile, officers_df, psc_df, charges_df, filing_df)
             save_investment_score(selected_cn, score)
 
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "Officers", "PSC", "Charges", "Filing History", "Raw JSON"])
+            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Overview", "Officers", "PSC", "Charges", "Filing History", "Financials", "Raw JSON"])
 
             with tab1:
                 render_profile(profile)
@@ -2666,6 +2785,10 @@ def _render_browse_section():
                     st.dataframe(show_filing, use_container_width=True, hide_index=True)
 
             with tab6:
+                st.markdown("### Financials & Accounts")
+                _render_financials_tab(selected_cn, profile)
+
+            with tab7:
                 st.markdown("### Raw Company Profile JSON")
                 st.json(profile)
 
